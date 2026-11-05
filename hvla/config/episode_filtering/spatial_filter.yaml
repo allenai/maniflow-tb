@@ -1,0 +1,16 @@
+type: hvla.dataloader.episode_filtering.dataset_filters.ClassifyEpisodesSpatial
+spatial_region: outside
+object_col: observation.state.object_pose.block_r
+bounds: [0.45, 0.65, -0.1, 0.1]
+inside_outside_margin: 0.03
+
+# apply_to_datasets: only filter episodes from these datasets (by dir name
+# or 0-based index). Omit or set to null to filter all datasets.
+# Example: apply_to_datasets: [may28_topdown_flip_22k_depth]
+apply_to_datasets: null
+
+# val_complements is used by default for val and eval (if non-empty),
+# but it can be overridden with an empty list to use the parameters
+# defined above (which are also the ones used for train)
+val_complements:
+  - spatial_region
