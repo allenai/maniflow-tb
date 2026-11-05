@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maniflow-tb"
+authors = [
+    {name = "ToyBlocks Team (Ai2)"},
+]
+description = "ManiFlow training code for low-level action models in ToyBlocks."
+version = "1.0.0"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["robot learning", "robotic manipulation", "flow matching", "maniflow", "toyblocks"]
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = [
+    "tests",
+    "cache",
+    "playground",
+    "results",
+    "checkpoints",
+    "scripts",
+    "eval",
+    ".vscode",
+    "*.egg-info",
+    "**.log",
+    "*.tmp",
+    "*.bak",
+    "**__pycache__**",
+    "*.pyc",
+    "*.pyo",
+    "**bar**",
+    "hvla/config",
+]
+
+[tool.black]
+line-length = 121
+target-version = ["py310"]
+preview = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 121
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["A", "B", "E", "F", "I", "RUF", "W"]
+ignore = ["F722"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401"]

@@ -1,0 +1,395 @@
+"""Generate a text architecture diagram of the ManiFlow MultiModal model.
+
+Called once at the start of training (rank 0 only) when --save_arch_diagram is set.
+Writes to <run_dir>/architecture.txt.
+"""
+
+import io
+
+from omegaconf import OmegaConf
+
+
+def generate_arch_diagram(cfg, model) -> str:
+    """Generate a text architecture diagram with dimensions and parameter counts."""
+    out = io.StringIO()
+    W = 76
+
+    def hr(c='═'): out.write(c * W + '\n')
+    def ln(t=''): out.write(t + '\n')
+    def sec(title):
+        ln(); hr(); ln(title.center(W)); hr()
+
+    # ── extract config ──
+    fw = cfg.framework
+    sm = OmegaConf.to_container(fw.shape_meta, resolve=True)
+    obs_meta = {k: v for k, v in sm['obs'].items() if v is not None}
+    action_dim = sm['action']['shape'][0]
+    state_dim = obs_meta.get('agent_pos', {}).get('shape', [19])[0]
+    horizon = int(fw.horizon)
+    n_action_steps = int(fw.n_action_steps)
+    n_obs_steps = int(getattr(fw, 'n_obs_steps', 1))
+    n_layer = int(fw.n_layer)
+    n_head = int(fw.n_head)
+    n_emb = int(fw.n_emb)
+    img_size = 224
+    use_rgb = getattr(fw, 'use_rgb', True)
+    use_ptmap = getattr(fw, 'use_ptmap', False)
+    rgb_backbone = getattr(fw, 'rgb_backbone', 'vit_base_patch16_clip_224.openai')
+    ptmap_backbone = getattr(fw, 'ptmap_backbone', 'convnextv2_tiny.fcmae_ft_in22k_in1k')
+    ptmap_encoder_type = getattr(fw, 'ptmap_encoder_type', 'dense')
+    language_conditioned = getattr(fw, 'language_conditioned', False)
+    lang_injection_mode = getattr(fw, 'lang_injection_mode', 'token')
+    state_injection_mode = getattr(fw, 'state_injection_mode', 'token')
+    target_mode = getattr(fw, 'target_injection_mode', None)
+    if target_mode in ('null', None):
+        target_mode = None
+    heatmap_encoder_type = getattr(fw, 'heatmap_encoder_type', 'shared_rgb')
+    t_embed_dim = int(getattr(fw, 'diffusion_timestep_embed_dim', 128))
+    tt_embed_dim = int(getattr(fw, 'diffusion_target_t_embed_dim', 128))
+    num_inference_steps = int(getattr(fw, 'num_inference_steps', 12))
+    flow_ratio = float(getattr(fw, 'flow_batch_ratio', 0.75))
+    ct_ratio = float(getattr(fw, 'consistency_batch_ratio', 0.25))
+
+    rgb_keys = sorted(k for k in obs_meta if k.endswith('_rgb'))
+    depth_keys = sorted(k for k in obs_meta if k.endswith('_depth'))
+    ptmap_keys_list = sorted(k for k in obs_meta if k.endswith('_ptmap'))
+
+    # ── dataset config for state/action descriptions ──
+    ds = cfg.datasets.vla_data if hasattr(cfg, 'datasets') else None
+    action_mode = str(getattr(ds, 'action_mode', 'abs')) if ds else 'abs'
+    joint_only = getattr(ds, 'joint_only_state', False) if ds else False
+    if isinstance(joint_only, str):
+        joint_only = joint_only.lower() == 'true'
+    zero_state = getattr(ds, 'zero_state', False) if ds else False
+    if isinstance(zero_state, str):
+        zero_state = zero_state.lower() == 'true'
+    use_ft = getattr(ds, 'use_ft', False) if ds else False
+    if isinstance(use_ft, str):
+        use_ft = use_ft.lower() == 'true'
+    action_keys_raw = getattr(ds, 'action_keys', None) if ds else None
+    if isinstance(action_keys_raw, str) and action_keys_raw:
+        custom_action_keys = [k.strip() for k in action_keys_raw.split(',')]
+    elif action_keys_raw:
+        custom_action_keys = list(action_keys_raw)
+    else:
+        custom_action_keys = None
+
+    # ── extract from built model ──
+    policy = model.policy
+    enc = policy.obs_encoder
+    ditx = policy.model
+    rgb_feat_dim = enc.rgb_feature_dim if use_rgb else 0
+    ptmap_feat_dim = enc.ptmap_feature_dim if use_ptmap else 0
+    tok_per_rgb = enc.tokens_per_rgb_cam if use_rgb else 0
+    tok_per_ptmap = enc.tokens_per_ptmap_cam if use_ptmap else 0
+    n_rgb_cams = enc.n_rgb_cams if use_rgb else 0
+    n_ptmap_cams = enc.n_ptmap_cams if use_ptmap else 0
+    total_rgb_tok = n_rgb_cams * tok_per_rgb
+    total_ptmap_tok = n_ptmap_cams * tok_per_ptmap
+
+    hm_feat_dim = enc.heatmap_feature_dim
+    hm_tokens = enc.tokens_per_heatmap
+
+    def _count(m): return sum(p.numel() for p in m.parameters())
+    def _fmt(n): return f'{n/1e6:.2f}M' if n >= 1e6 else f'{n/1e3:.1f}K' if n >= 1e3 else str(n)
+
+    policy_params = _count(policy)
+    enc_params = _count(enc)
+    ditx_params = _count(ditx)
+
+    # ── sub-component params ──
+    sub_params = {}
+    if use_rgb and hasattr(enc, 'rgb_encoder'):
+        sub_params['rgb_encoder'] = _count(enc.rgb_encoder)
+    if use_ptmap:
+        if hasattr(enc, 'ptmap_encoder'):
+            sub_params['ptmap_encoder'] = _count(enc.ptmap_encoder)
+        elif hasattr(enc, 'defm_encoder'):
+            sub_params['defm_encoder'] = _count(enc.defm_encoder)
+    if language_conditioned and hasattr(ditx, 'language_encoder'):
+        sub_params['T5_encoder (frozen)'] = _count(ditx.language_encoder)
+
+    # ── header ──
+    ln('ManiFlow MultiModal — Architecture Diagram')
+    ln(f'Run: {getattr(cfg, "run_id", "unknown")}')
+    ln(f'Generated by arch_diagram.py')
+    ln()
+
+    # ── INPUTS ──
+    sec('INPUTS')
+    ln()
+    for k in rgb_keys:
+        s = obs_meta[k]['shape']
+        ln(f'  obs/{k:<22s} [B, {n_obs_steps}, {s[0]}, {s[1]}, {s[2]}]')
+    for k in depth_keys:
+        s = obs_meta[k]['shape']
+        ln(f'  obs/{k:<22s} [B, {n_obs_steps}, {s[0]}, {s[1]}, {s[2]}]')
+    for k in ptmap_keys_list:
+        s = obs_meta[k]['shape']
+        ln(f'  obs/{k:<22s} [B, {n_obs_steps}, {s[0]}, {s[1]}, {s[2]}]')
+    if 'camera_intrinsics' in obs_meta:
+        s = obs_meta['camera_intrinsics']['shape']
+        ln(f'  obs/{"camera_intrinsics":<22s} [B, {n_obs_steps}, {", ".join(str(x) for x in s)}]')
+
+    # State vector breakdown
+    ln(f'  obs/{"agent_pos":<22s} [B, {n_obs_steps}, {state_dim}]')
+    if zero_state:
+        ln(f'       (zeroed out — no proprioception, dim kept for architecture)')
+    elif joint_only:
+        ln(f'       [0:7]  joint_pos=7   joint angles (rad)')
+        ln(f'       [7]    gripper=1     gripper width')
+    else:
+        ln(f'       [0:7]  joint_pos=7   joint angles (rad)')
+        ln(f'       [7:14] joint_vel=7   joint velocities (rad/s)')
+        ln(f'       [14:17] ee_xyz=3     end-effector position (m)')
+        ln(f'       [17]   gripper=1     gripper width')
+        ln(f'       [18]   pd_mode=1     controller mode flag')
+    if use_ft:
+        ft_start = 8 if joint_only else 19
+        ln(f'       [{ft_start}:{ft_start+6}] wrench=6     F/T sensor (Fx,Fy,Fz,Tx,Ty,Tz)')
+
+    # Action vector breakdown
+    ln(f'  {"action":<26s} [B, {horizon}, {action_dim}]')
+    if custom_action_keys:
+        ln(f'       custom keys: {", ".join(custom_action_keys)}')
+    elif action_mode == 'ee':
+        ln(f'       [0:3]  ee_pos=3      end-effector XYZ (m)')
+        ln(f'       [3:6]  ee_rot=3      end-effector rotation')
+        ln(f'       [6]    gripper=1     gripper command')
+        ln(f'       [7]    pd_mode=1     controller mode flag')
+    else:
+        mode_label = 'absolute' if action_mode == 'abs' else 'relative'
+        ln(f'       [0:7]  joint_pos=7   target joint angles, {mode_label} (rad)')
+        ln(f'       [7]    gripper=1     gripper command')
+        ln(f'       [8]    pd_mode=1     controller mode flag')
+    ln(f'       horizon={horizon}, execute first {n_action_steps} steps')
+
+    if language_conditioned:
+        lang_mode = str(getattr(fw, 'language_mode', 'action_goal'))
+        ln(f'  {"lang":<26s} List[str]  (language_mode={lang_mode})')
+    if target_mode in ('target_embedding', 'target_pe'):
+        ln(f'  {"obs/target_xy":<26s} [B, {n_obs_steps}, 2]  (pixel coords)')
+    if target_mode in ('token', 'timestep_concat'):
+        ln(f'  {"obs/target_heatmap":<26s} [B, 3, {img_size}, {img_size}]')
+
+    # ── OBSERVATION ENCODER ──
+    sec('OBSERVATION ENCODER  (MultiModalObsEncoder)')
+    ln()
+    if use_rgb:
+        crop_size = int(img_size * getattr(fw, 'random_crop_ratio', 0.95))
+        rot_deg = getattr(fw, 'random_rotation_degrees', 5.0)
+        patch = 16 if 'patch16' in rgb_backbone else 14
+        grid = img_size // patch
+        ln(f'  RGB Encoder  (shared weights across {n_rgb_cams} cameras)')
+        ln(f'  ├── Cameras: {", ".join(rgb_keys)}')
+        ln(f'  ├── Stack → [B×{n_rgb_cams}, 3, {img_size}, {img_size}]')
+        ln(f'  ├── Train augment (in dataloader, shared with heatmap/depth): '
+           f'Crop({crop_size})→Resize({img_size})→Rot(±{rot_deg}°)→ColorJitter(RGB only)')
+        ln(f'  ├── ImageNet normalize (CLIP mean/std)')
+        ln(f'  ├── Backbone: {rgb_backbone}')
+        ln(f'  │     features_only → [B×{n_rgb_cams}, {rgb_feat_dim}, {grid}, {grid}]')
+        ln(f'  ├── Flatten → [B×{n_rgb_cams}, {tok_per_rgb}, {rgb_feat_dim}]')
+        ln(f'  └── Reshape → rgb_tokens: [B, {total_rgb_tok}, {rgb_feat_dim}]')
+        ln(f'       ({n_rgb_cams} cam × {tok_per_rgb} spatial tokens × {rgb_feat_dim} dim)')
+        ln()
+
+    if use_ptmap:
+        ln(f'  Depth/Pointmap Encoder  (encoder_type={ptmap_encoder_type})')
+        if depth_keys:
+            ln(f'  ├── Depth cameras: {", ".join(depth_keys)}')
+            ln(f'  ├── GPU back-projection: depth + intrinsics → XYZ pointmap')
+            ln(f'  │     [B×{n_ptmap_cams}, 1, {img_size}, {img_size}] → [B×{n_ptmap_cams}, 3, {img_size}, {img_size}]')
+        else:
+            ln(f'  ├── Pointmap cameras: {", ".join(ptmap_keys_list)}')
+        if ptmap_encoder_type == 'shared_rgb':
+            ln(f'  ├── Normalize (per-camera bounds → [-1,1])')
+            ln(f'  ├── Shared RGB ViT backbone: {rgb_backbone}')
+            ln(f'  │     features_only → [B×{n_ptmap_cams}, {ptmap_feat_dim}, {grid}, {grid}]')
+        elif ptmap_encoder_type == 'sparse':
+            sp_pts = int(getattr(fw, 'sparse_num_points', 64))
+            ln(f'  ├── Normalize + FPS/random sample → [B×{n_ptmap_cams}, {sp_pts}, 3]')
+            ln(f'  ├── PointNet MLP(3→128→128→{ptmap_feat_dim})')
+        elif ptmap_encoder_type == 'defm':
+            ln(f'  ├── DeFM metric-aware normalization → 3-channel input')
+            ln(f'  ├── DeFM ViT-S/14 (frozen)')
+        else:
+            ln(f'  ├── Normalize (clamp + linear → [-1,1])')
+            ln(f'  ├── Backbone: {ptmap_backbone}')
+        ln(f'  ├── Flatten → [B×{n_ptmap_cams}, {tok_per_ptmap}, {ptmap_feat_dim}]')
+        ln(f'  └── Reshape → ptmap_tokens: [B, {total_ptmap_tok}, {ptmap_feat_dim}]')
+        ln(f'       ({n_ptmap_cams} cam × {tok_per_ptmap} tokens × {ptmap_feat_dim} dim)')
+        ln()
+
+    if target_mode in ('token', 'timestep_concat'):
+        ln(f'  Heatmap Encoder  (type={heatmap_encoder_type})')
+        if heatmap_encoder_type == 'shared_rgb':
+            ln(f'  ├── Shared RGB backbone on heatmap image')
+        else:
+            ln(f'  ├── Dedicated backbone: {getattr(fw, "heatmap_backbone", "convnextv2_tiny")}')
+        ln(f'  └── heatmap_tokens: [B, {hm_tokens}, {hm_feat_dim}]')
+        ln()
+
+    ln(f'  State  (raw pass-through to DiTX, adaptor applied there)')
+    ln(f'  └── state_emb: [B, {state_dim}]')
+
+    # ── DiTX TRANSFORMER ──
+    sec('DiTX TRANSFORMER')
+    ln()
+
+    # Action input
+    ln(f'  ACTION INPUT')
+    ln(f'  ├── noisy_action: [B, {horizon}, {action_dim}]  (x_t = lerp(noise, action, t))')
+    ln(f'  ├── input_emb: Linear({action_dim} → {n_emb}) → [B, {horizon}, {n_emb}]')
+    ln(f'  └── + pos_emb [1, {horizon}, {n_emb}] → x: [B, {horizon}, {n_emb}]')
+    ln()
+
+    # Time conditioning
+    ln(f'  TIME CONDITIONING  (fused → AdaLN modulation)')
+    t_mid = t_embed_dim * 4
+    tt_mid = tt_embed_dim * 4
+    ln(f'  ├── flow_timestep (scalar)')
+    ln(f'  │     SinPosEmb({t_embed_dim}) → Lin({t_embed_dim}→{t_mid}) → Mish → Lin({t_mid}→{n_emb})')
+    ln(f'  │     → [B, {n_emb}]')
+    ln(f'  ├── target_t (scalar)')
+    ln(f'  │     SinPosEmb({tt_embed_dim}) → Lin({tt_embed_dim}→{tt_mid}) → Mish → Lin({tt_mid}→{n_emb})')
+    ln(f'  │     → [B, {n_emb}]')
+
+    n_time_parts = 2
+    time_part_labels = ['timestep_emb', 'target_t_emb']
+
+    if state_injection_mode == 'timestep_concat':
+        ln(f'  ├── state_emb [B, {state_dim}]  (state_injection = timestep_concat)')
+        ln(f'  │     state_adaptor: Lin({state_dim}→{n_emb}) → GELU → Lin({n_emb}→{n_emb})')
+        ln(f'  │     → LayerNorm → [B, {n_emb}]')
+        n_time_parts += 1
+        time_part_labels.append('state')
+
+    if language_conditioned and lang_injection_mode == 'timestep_concat':
+        t5_dim = 512
+        ln(f'  ├── lang_emb  (lang_injection = timestep_concat)')
+        ln(f'  │     T5-small → sentence [B, {t5_dim}]')
+        ln(f'  │     lang_adaptor: Lin({t5_dim}→{n_emb}) → GELU → Lin({n_emb}→{n_emb})')
+        ln(f'  │     → [B, {n_emb}]')
+        n_time_parts += 1
+        time_part_labels.append('lang')
+
+    if target_mode == 'timestep_concat':
+        ln(f'  ├── heatmap_pooled  (target = timestep_concat)')
+        ln(f'  │     mean-pool heatmap_tokens → [B, {hm_feat_dim}]')
+        ln(f'  │     heatmap_adaptor → LayerNorm → [B, {n_emb}]')
+        n_time_parts += 1
+        time_part_labels.append('heatmap')
+
+    time_cat_dim = n_emb * n_time_parts
+    ln(f'  ├── Concat([{", ".join(time_part_labels)}]) → [B, {time_cat_dim}]')
+    ln(f'  └── Linear({time_cat_dim} → {n_emb}) → time_c: [B, {n_emb}]')
+    ln()
+
+    # Cross-attention context
+    ln(f'  CROSS-ATTENTION CONTEXT')
+    ctx_parts = []
+    ctx_tok_desc = []
+    if use_rgb:
+        ln(f'  ├── rgb_tokens [B, {total_rgb_tok}, {rgb_feat_dim}]')
+        ln(f'  │     rgb_adaptor: Lin({rgb_feat_dim}→{n_emb}) → GELU → Lin({n_emb}→{n_emb})')
+        ln(f'  │     + rgb_pos_embed [1, {total_rgb_tok}, {n_emb}]')
+        if target_mode == 'target_embedding':
+            sigma = getattr(fw, 'target_sigma', 1.5)
+            mask_p = getattr(fw, 'target_mask_prob', 0.0)
+            ln(f'  │     + target_embedding: Gaussian bias on front-cam tokens')
+            ln(f'  │       (sigma={sigma} patches, mask_prob={mask_p})')
+        elif target_mode == 'target_pe':
+            ln(f'  │     + target_pe: learned pos-encoding weighted by Gaussian')
+        ln(f'  │     → LayerNorm → [B, {total_rgb_tok}, {n_emb}]')
+        ctx_parts.append('rgb')
+        ctx_tok_desc.append(f'{total_rgb_tok}')
+
+    if use_ptmap and getattr(ditx, 'ptmap_injection_mode', 'token') == 'token':
+        ln(f'  ├── ptmap_tokens [B, {total_ptmap_tok}, {ptmap_feat_dim}]')
+        ln(f'  │     ptmap_adaptor: Lin({ptmap_feat_dim}→{n_emb}) → GELU → Lin({n_emb}→{n_emb})')
+        ln(f'  │     + ptmap_pos_embed [1, {total_ptmap_tok}, {n_emb}]')
+        ln(f'  │     → LayerNorm → [B, {total_ptmap_tok}, {n_emb}]')
+        ctx_parts.append('ptmap')
+        ctx_tok_desc.append(f'{total_ptmap_tok}')
+
+    if state_injection_mode == 'token':
+        ln(f'  ├── state_token [B, 1, {state_dim}]')
+        ln(f'  │     state_adaptor: Lin({state_dim}→{n_emb}) → GELU → Lin({n_emb}→{n_emb})')
+        ln(f'  │     + state_pos_embed [1, 1, {n_emb}]')
+        ln(f'  │     → LayerNorm → [B, 1, {n_emb}]')
+        ctx_parts.append('state')
+        ctx_tok_desc.append('1')
+
+    if language_conditioned and lang_injection_mode == 'token':
+        t5_dim = 512
+        ln(f'  ├── lang_tokens  (lang_injection = token)')
+        ln(f'  │     T5-small (frozen): text → [B, L, {t5_dim}]  (L = num_wordpieces)')
+        ln(f'  │     lang_adaptor: Lin({t5_dim}→{n_emb}) → GELU → Lin({n_emb}→{n_emb})')
+        ln(f'  │     + lang_pos_embed [1, 64, {n_emb}]')
+        ln(f'  │     → LayerNorm → [B, L, {n_emb}]')
+        ctx_parts.append('lang')
+        ctx_tok_desc.append('L')
+
+    if target_mode == 'token':
+        mask_p = getattr(fw, 'target_mask_prob', 0.0)
+        ln(f'  ├── heatmap_tokens [B, {hm_tokens}, {hm_feat_dim}]  (target = token)')
+        ln(f'  │     heatmap_adaptor: Lin({hm_feat_dim}→{n_emb}) → GELU → Lin({n_emb}→{n_emb})')
+        ln(f'  │     + heatmap_pos_embed [1, {hm_tokens}, {n_emb}]')
+        ln(f'  │     mask_prob={mask_p} (randomly zero during training)')
+        ln(f'  │     → LayerNorm → [B, {hm_tokens}, {n_emb}]')
+        ctx_parts.append('heatmap')
+        ctx_tok_desc.append(f'{hm_tokens}')
+
+    ctx_total = '+'.join(ctx_tok_desc)
+    ln(f'  └── context_c = cat([{", ".join(ctx_parts)}]) → [B, {ctx_total}, {n_emb}]')
+    ln()
+
+    # Transformer blocks
+    mlp_hidden = n_emb * 4
+    ln(f'  TRANSFORMER BLOCKS  (×{n_layer})')
+    ln(f'  ┌{"─" * (W - 4)}┐')
+    ln(f'  │{"DiTXBlock(hidden={}, heads={}, mlp_ratio=4.0)".format(n_emb, n_head).center(W - 4)}│')
+    ln(f'  │{"".center(W - 4)}│')
+    ln(f'  │{"  1. AdaLN(time_c) → Self-Attention".ljust(W - 5)}│')
+    ln(f'  │{"       Q,K,V from x: [B, {}, {}]".format(horizon, n_emb).ljust(W - 5)}│')
+    ln(f'  │{"  2. AdaLN(time_c) → Cross-Attention(x, context_c)".ljust(W - 5)}│')
+    ln(f'  │{"       Q from x, K/V from context_c".ljust(W - 5)}│')
+    ln(f'  │{"  3. AdaLN(time_c) → MLP({} → {} → {})".format(n_emb, mlp_hidden, n_emb).ljust(W - 5)}│')
+    ln(f'  │{"".center(W - 4)}│')
+    ln(f'  │{"  9-way AdaLN modulation per block (shift/scale/gate × 3 sub-layers)".ljust(W - 5)}│')
+    ln(f'  └{"─" * (W - 4)}┘')
+    ln()
+
+    # Output
+    ln(f'  OUTPUT HEAD')
+    ln(f'  ├── FinalLayer: RmsNorm({n_emb}) → MLP({n_emb} → {n_emb} → {action_dim})')
+    ln(f'  └── predicted velocity: [B, {horizon}, {action_dim}]')
+
+    # ── TRAINING & INFERENCE ──
+    sec('TRAINING & INFERENCE')
+    ln()
+    ln(f'  Training:')
+    ln(f'    Consistency Flow: {flow_ratio*100:.0f}% flow matching + {ct_ratio*100:.0f}% consistency training')
+    ln(f'    EMA teacher model (shadow copy of full policy)')
+    ln(f'    Loss: MSE on predicted velocity vs target velocity')
+    ln()
+    ln(f'  Inference:')
+    ln(f'    ODE solver: {num_inference_steps} Euler steps (t=0 → t=1)')
+    ln(f'    Execute action steps [0:{n_action_steps}] of horizon {horizon}')
+    ln(f'    → output: [B, {n_action_steps}, {action_dim}]')
+
+    # ── PARAMETERS ──
+    sec('PARAMETER COUNTS')
+    ln()
+    enc_pct = enc_params / policy_params * 100
+    ditx_pct = ditx_params / policy_params * 100
+    ln(f'  obs_encoder {"." * 30} {_fmt(enc_params):>10s}  ({enc_pct:.1f}%)')
+    for name, cnt in sub_params.items():
+        ln(f'    {name} {"." * (28 - len(name))} {_fmt(cnt):>10s}')
+    ln(f'  model (DiTX) {"." * 28} {_fmt(ditx_params):>10s}  ({ditx_pct:.1f}%)')
+    ln(f'  {"─" * 50}')
+    ln(f'  Total (policy) {"." * 26} {_fmt(policy_params):>10s}')
+    ln(f'  Total (with EMA copy) {"." * 20} {_fmt(policy_params * 2):>10s}')
+    ln()
+
+    return out.getvalue()
