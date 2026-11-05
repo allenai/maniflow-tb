@@ -22,7 +22,7 @@ conda create -y -n maniflow-tb python=3.10
 conda activate maniflow-tb
 # CUDA toolkit (nvcc): DeepSpeed queries it on import
 conda install -c nvidia cuda-toolkit=12.8 -y
-cd HierarchicalVLA
+cd maniflow-tb
 pip install -r requirements.txt
 ```
 
