@@ -58,3 +58,7 @@ and `stats.json`. The trained checkpoint on Hugging Face,
 ```bash
 hf download allenai/maniflow-tb --local-dir maniflow-tb
 ```
+
+## License
+
+This code is released under the [Apache License 2.0](LICENSE).
