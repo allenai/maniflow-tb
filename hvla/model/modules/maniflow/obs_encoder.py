@@ -587,7 +587,7 @@ class MultiModalObsEncoder(nn.Module):
                         depth_flat = depth_stack.reshape(B * self.n_ptmap_cams, 1, self.img_size, self.img_size)
                         intrinsics = obs["camera_intrinsics"]
                         intrinsics_flat = intrinsics.reshape(B * self.n_ptmap_cams, 4)
-                        ptmaps_raw = self._depth_to_pointmap_gpu(depth_flat, intrinsics_flat, obs.get("aug_H_inv"))
+                        ptmaps_raw = self._depth_to_pointmap_gpu(depth_flat, intrinsics_flat)
                 else:
                     # Possibly Not implemented for Franka. Add an assert if confident
                     ptmaps_raw = torch.stack([obs[k] for k in self.ptmap_keys], dim=1)
